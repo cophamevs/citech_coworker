@@ -1,0 +1,37 @@
+{
+    "shutdown_timeout": 60,
+    "heartbeat_interval": 30,
+    "task_timeout": 300,
+    "max_retries": 3,
+    "memory_limit_per_agent": 50,
+    "memory_inject_count": 5,
+    "agents": [
+        {
+            "id": "agent-01",
+            "role": "coder",
+            "port": 4096,
+            "workdir": "./workspace/agent-01"
+        },
+        {
+            "id": "agent-02",
+            "role": "sysadmin",
+            "port": 4097,
+            "workdir": "./workspace/agent-02"
+        }
+    ],
+    "telegram": {
+        "allowed_users": [],
+        "rate_limit_per_minute": 5
+    },
+    "security": {
+        "max_task_length": 2000,
+        "allowed_cli_commands": [
+            "task",
+            "status",
+            "logs",
+            "spawn",
+            "history",
+            "memory"
+        ]
+    }
+}
