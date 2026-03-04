@@ -61,12 +61,14 @@ async function waitAllIdle(agents, timeoutMs = 60_000) {
 async function gracefulShutdown(signal) {
     console.log(`\n[shutdown] Received ${signal}. Shutting down gracefully...`)
 
-    // 1. Stop heartbeat — no more health checks
+    // 1. Stop heartbeat + orchestrator watcher
     heartbeat.stop()
+    orchestrator.stopWatcher()
 
-    // 2. Mark all agents as shutting down (reject new tasks)
+    // 2. Stop worker loops + mark agents as shutting down
     const agents = registry.getInstances()
     for (const agent of agents) {
+        agent.stopWorkerLoop()
         await agent.markShuttingDown()
     }
 
@@ -118,6 +120,11 @@ async function main() {
     // Spawn agents
     await spawnConfiguredAgents()
 
+    // ── Start worker loops on all agents ──
+    for (const agent of registry.getInstances()) {
+        agent.startWorkerLoop(3000)  // poll DB every 3s
+    }
+
     // Start heartbeat
     heartbeat.start()
 
@@ -129,6 +136,12 @@ async function main() {
     if (bot) {
         bot.launch()
         console.log('[index] Telegram bot launched')
+
+        // ── Start orchestrator watcher — sends results back to Telegram ──
+        orchestrator.startWatcher(async (task) => {
+            await bot.onTaskResult(task)
+        }, 2000)
+        console.log('[index] Orchestrator watcher started')
     }
 
     // Expose CLI for interactive use

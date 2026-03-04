@@ -4,7 +4,7 @@ import { checkRateLimit, validateInstruction, isAllowedUser } from '../lib/secur
 import { getRecentTasks } from '../lib/memory.js'
 
 /**
- * Create and configure a Telegram bot adapter
+ * Create and configure a Telegram bot adapter (DB-Centric async pattern)
  * @param {import('../lib/orchestrator.js').Orchestrator} orchestrator
  * @param {import('../lib/registry.js').AgentRegistry} registry
  * @param {Object} config
@@ -26,79 +26,116 @@ export function createTelegramAdapter(orchestrator, registry, config = {}) {
 
     const bot = new Telegraf(token, { handlerTimeout: 900_000 })
 
-    // Track user preferences: userId -> role ('coder', 'sysadmin', 'researcher', or null for auto)
+    // Track user preferences: userId -> role
     const userPreferences = new Map()
 
-    // Per-user task queue: userId -> Array of { instruction, opts, ctx }
-    const userQueues = new Map()
-    // Per-user processing flag (prevents concurrent queue runners)
-    const userProcessing = new Set()
+    // Track pending "⏳" messages so watcher can reply inline
+    // Map<taskId, { chatId, processingMsgId }>
+    const pendingNotifications = new Map()
 
     /**
-     * Enqueue a task for a user and start processing if idle.
-     * Tasks are processed sequentially — new tasks wait in queue.
+     * Submit a task to the DB queue and reply "⏳ Processing..."
+     * The watcher callback (set up in index.js) will call onTaskResult() when done.
      */
-    async function enqueueTask(userId, ctx, instruction, opts = {}) {
-        if (!userQueues.has(userId)) userQueues.set(userId, [])
-        const queue = userQueues.get(userId)
-        queue.push({ instruction, opts, ctx })
+    async function submitTaskAsync(ctx, instruction, opts = {}) {
+        const chatId = ctx.chat.id
+        const roleLabel = opts.role ? ` (via ${opts.role})` : ' (via Orchestrator)'
 
-        const position = queue.length
-        if (position > 1) {
-            await ctx.reply(
-                `📋 Task added to queue (position *#${position}*).\nWaiting for previous task to complete...`,
-                { parse_mode: 'Markdown' }
-            )
-        }
+        // Send processing message
+        const processingMsg = await ctx.reply(`⏳ Processing...${roleLabel}`)
 
-        // Start processing loop if not already running for this user
-        if (!userProcessing.has(userId)) {
-            processQueue(userId)
-        }
+        // Submit to DB queue
+        const taskId = orchestrator.submitTask(instruction, {
+            ...opts,
+            telegramChatId: String(chatId),
+            telegramMsgId: String(processingMsg.message_id)
+        })
+
+        // Track for watcher callback
+        pendingNotifications.set(taskId, {
+            chatId,
+            processingMsgId: processingMsg.message_id
+        })
+
+        console.log(`[telegram] Task ${taskId} queued for chat ${chatId}`)
     }
-
     /**
-     * Sequential queue processor — runs tasks one by one until queue is empty.
+     * Called by the orchestrator watcher when a task completes.
+     * Sends the result back to the Telegram chat.
      */
-    async function processQueue(userId) {
-        if (userProcessing.has(userId)) return
-        userProcessing.add(userId)
+    async function onTaskResult(task) {
+        const chatId = task.telegram_chat_id
+        if (!chatId) return
 
-        while (true) {
-            const queue = userQueues.get(userId) || []
-            if (queue.length === 0) break
+        const pending = pendingNotifications.get(task.id)
+        pendingNotifications.delete(task.id)
 
-            const { instruction, opts, ctx } = queue[0]
-
-            try {
-                const roleLabel = opts.role ? ` (via ${opts.role})` : ' (via Orchestrator)'
-                await ctx.reply(`⏳ Processing...${roleLabel}`)
-
-                const { taskId, result, agentId } = await orchestrator.submitTask(instruction, opts)
+        try {
+            let text
+            if (task.status === 'done') {
+                const result = task.result || '(empty response)'
                 const preview = result.length > 3000
                     ? result.slice(0, 3000) + '\n...(truncated)'
                     : result
+                const agentLabel = task.agent_id || 'unknown'
+                text = `✅ Task #${task.id.slice(0, 8)} done by ${agentLabel}\n\n${preview}`
+            } else if (task.status === 'failed') {
+                const errorMsg = task.error || 'Unknown error'
+                text = `❌ Task #${task.id.slice(0, 8)} failed:\n${errorMsg}`
+            } else {
+                return
+            }
 
-                await ctx.reply(
-                    `✅ Task \`#${taskId.slice(0, 8)}\` done by \`${agentId}\`${opts.role ? '' : ' (delegated by Orchestrator)'}\n\n${preview}`,
-                    { parse_mode: 'Markdown' }
-                )
+            // Try to edit the "⏳ Processing..." message, then fallback to new message
+            // Strategy: try Markdown → fallback to plain text (no parse_mode)
+            const sent = await trySendTelegram(chatId, text, pending?.processingMsgId)
+            if (sent) {
+                console.log(`[telegram] ✅ Result sent for task ${task.id.slice(0, 8)}`)
+            } else {
+                console.error(`[telegram] ❌ All send attempts failed for task ${task.id.slice(0, 8)}`)
+            }
+        } catch (err) {
+            console.error(`[telegram] Failed to send result for task ${task.id}: ${err.message}`)
+        }
+    }
+
+    /**
+     * Try multiple strategies to send a message to Telegram.
+     * Returns true if any succeeded.
+     */
+    async function trySendTelegram(chatId, text, editMsgId = null) {
+        // 1. Try edit existing message (plain text — safest)
+        if (editMsgId) {
+            try {
+                await bot.telegram.editMessageText(chatId, editMsgId, undefined, text)
+                return true
             } catch (err) {
-                await ctx.reply(`❌ Task failed: ${err.message}`)
-            } finally {
-                queue.shift()
-                const remaining = queue.length
-                if (remaining > 0) {
-                    await ctx.reply(
-                        `📋 *${remaining}* tasks remaining in queue. Continuing...`,
-                        { parse_mode: 'Markdown' }
-                    )
-                }
+                console.warn(`[telegram] editMessage failed: ${err.message}`)
             }
         }
 
-        userProcessing.delete(userId)
+        // 2. Try send new message (plain text)
+        try {
+            await bot.telegram.sendMessage(chatId, text)
+            return true
+        } catch (err) {
+            console.warn(`[telegram] sendMessage failed: ${err.message}`)
+        }
+
+        // 3. Last resort — send truncated
+        try {
+            const short = text.slice(0, 1000) + '\n...(message too long)'
+            await bot.telegram.sendMessage(chatId, short)
+            return true
+        } catch (err) {
+            console.error(`[telegram] All send attempts failed: ${err.message}`)
+        }
+
+        return false
     }
+
+    // Expose onTaskResult for watcher callback
+    bot.onTaskResult = onTaskResult
 
     // ── Auth middleware ──────────────────────────────────────────────────────
     bot.use(async (ctx, next) => {
@@ -117,7 +154,6 @@ export function createTelegramAdapter(orchestrator, registry, config = {}) {
             '`/agents` — List available agents to talk to\n' +
             '`/agent` — Switch to a specific agent\n' +
             '`/status` — Show agent status\n' +
-            '`/queue` — View your current task queue\n' +
             '`/help` — Show help\n\n' +
             'Tip: After choosing an agent via `/agent`, you can just chat directly!',
             { parse_mode: 'Markdown' }
@@ -131,9 +167,7 @@ export function createTelegramAdapter(orchestrator, registry, config = {}) {
         'Or use specific commands:\n' +
         '`/task fix the login bug in auth.js` — Ask coder agent\n' +
         '`/task check disk usage on server` — Ask sysadmin agent\n' +
-        '`/task explain how JWT works` — Ask researcher agent\n\n' +
-        '`/queue` — View your pending tasks\n' +
-        '`/clearqueue` — Clear all pending tasks\n',
+        '`/task explain how JWT works` — Ask researcher agent\n\n',
         { parse_mode: 'Markdown' }
     ))
 
@@ -169,47 +203,6 @@ export function createTelegramAdapter(orchestrator, registry, config = {}) {
         }
     })
 
-    // ── /queue ────────────────────────────────────────────────────────────────
-    bot.command('queue', (ctx) => {
-        const userId = ctx.from?.id
-        const queue = userQueues.get(userId) || []
-
-        if (queue.length === 0) {
-            return ctx.reply('✅ Queue is empty.')
-        }
-
-        const isProcessing = userProcessing.has(userId)
-        const lines = queue.map((item, i) => {
-            const label = i === 0 && isProcessing ? '⏳ (processing)' : `#${i + 1}`
-            const preview = item.instruction.slice(0, 60)
-            const ellipsis = item.instruction.length > 60 ? '...' : ''
-            return `${label} ${preview}${ellipsis}`
-        })
-
-        ctx.reply(`*Task Queue (${queue.length})*\n\n${lines.join('\n')}`, { parse_mode: 'Markdown' })
-    })
-
-    // ── /clearqueue ───────────────────────────────────────────────────────────
-    bot.command('clearqueue', (ctx) => {
-        const userId = ctx.from?.id
-        const queue = userQueues.get(userId) || []
-
-        if (queue.length === 0) {
-            return ctx.reply('✅ Queue is empty.')
-        }
-
-        const isProcessing = userProcessing.has(userId)
-        if (isProcessing && queue.length > 0) {
-            // Keep the currently-processing task, clear the rest
-            const current = queue[0]
-            userQueues.set(userId, [current])
-            ctx.reply(`🗑️ Removed ${queue.length - 1} tasks from queue.\nCurrent task will continue.`)
-        } else {
-            userQueues.set(userId, [])
-            ctx.reply(`🗑️ Removed ${queue.length} tasks from queue.`)
-        }
-    })
-
     // ── /task ─────────────────────────────────────────────────────────────────
     bot.command('task', async (ctx) => {
         const userId = ctx.from?.id
@@ -222,7 +215,7 @@ export function createTelegramAdapter(orchestrator, registry, config = {}) {
             return ctx.reply(`❌ ${err.message}`)
         }
 
-        await enqueueTask(userId, ctx, raw)
+        await submitTaskAsync(ctx, raw)
     })
 
     // ── /status ───────────────────────────────────────────────────────────────
@@ -266,7 +259,7 @@ export function createTelegramAdapter(orchestrator, registry, config = {}) {
 
         const preferredRole = userPreferences.get(userId)
         const opts = preferredRole ? { role: preferredRole } : {}
-        await enqueueTask(userId, ctx, instruction, opts)
+        await submitTaskAsync(ctx, instruction, opts)
     })
 
     return bot

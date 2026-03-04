@@ -34,7 +34,7 @@ export function createCLI(orchestrator, registry) {
 
             console.log(`⏳ Submitting task${opts.role ? ` (role: ${opts.role})` : ''}...`)
             try {
-                const { taskId, result, agentId } = await orchestrator.submitTask(instruction, {
+                const { taskId, result, agentId } = await orchestrator.submitTaskSync(instruction, {
                     role: opts.role,
                     agentId: opts.agent
                 })
