@@ -2,7 +2,7 @@
 import 'dotenv/config'
 import { Command } from 'commander'
 import { createReadStream } from 'fs'
-import { getRecentTasks, saveMemory } from '../lib/memory.js'
+import { getRecentTasks, saveMemory, listWorkflowRuns, getWorkflowRun, queryUsageSummary, queryUsageByAgent } from '../lib/memory.js'
 import { validateInstruction } from '../lib/security.js'
 
 /**
@@ -131,5 +131,109 @@ export function createCLI(orchestrator, registry) {
             console.log(`✅ Memory saved: ${key}`)
         })
 
+    // ── oc workflow (Phase 2) ─────────────────────────────────────────────────
+    const workflowCmd = program
+        .command('workflow')
+        .description('Manage and run multi-step workflows')
+
+    workflowCmd
+        .command('list')
+        .description('List available workflows')
+        .action(() => {
+            if (!orchestrator.workflowEngine) {
+                console.log('Workflow engine not initialized.')
+                return
+            }
+            const workflows = orchestrator.workflowEngine.listWorkflows()
+            if (workflows.length === 0) {
+                console.log('No workflows registered.')
+                return
+            }
+            console.log('\nAvailable Workflows\n' + '─'.repeat(50))
+            for (const wf of workflows) {
+                console.log(`  📋 ${wf.name.padEnd(30)} ${wf.steps} step(s)`)
+                if (wf.description) console.log(`     ${wf.description}`)
+            }
+            console.log()
+        })
+
+    workflowCmd
+        .command('run <name> <input>')
+        .description('Execute a workflow')
+        .action(async (name, input) => {
+            console.log(`⏳ Starting workflow: ${name}...`)
+            try {
+                const { runId, executePromise } = await orchestrator.submitWorkflow(name, input)
+                console.log(`🔄 Workflow run started: ${runId.slice(0, 8)}`)
+                console.log(`   Waiting for completion...`)
+                await executePromise
+                const run = getWorkflowRun(runId)
+                if (run?.state === 'completed') {
+                    console.log(`\n✅ Workflow completed!\n`)
+                    console.log(run.output || '(no output)')
+                } else {
+                    console.log(`\n❌ Workflow failed: ${run?.error || 'unknown error'}`)
+                }
+            } catch (err) {
+                console.error(`❌ Workflow failed: ${err.message}`)
+                process.exit(1)
+            }
+        })
+
+    workflowCmd
+        .command('status [runId]')
+        .description('Show workflow run status')
+        .action((runId) => {
+            if (runId) {
+                const run = getWorkflowRun(runId)
+                if (!run) {
+                    console.log(`Run not found: ${runId}`)
+                    return
+                }
+                console.log(`\nWorkflow Run: ${run.id.slice(0, 8)}`)
+                console.log(`  State: ${run.state}`)
+                console.log(`  Steps: ${run.step_results?.length || 0}`)
+                if (run.error) console.log(`  Error: ${run.error}`)
+                if (run.output) console.log(`  Output: ${run.output.slice(0, 200)}...`)
+            } else {
+                const runs = listWorkflowRuns(10)
+                if (runs.length === 0) {
+                    console.log('No workflow runs yet.')
+                    return
+                }
+                console.log('\nRecent Workflow Runs\n' + '─'.repeat(60))
+                for (const r of runs) {
+                    const icon = r.state === 'completed' ? '✅' : r.state === 'failed' ? '❌' : '🔄'
+                    console.log(`${icon} [${r.id.slice(0, 8)}] ${r.state.padEnd(12)} steps=${r.step_results?.length || 0}  ${r.created_at}`)
+                }
+                console.log()
+            }
+        })
+
+    // ── oc cost (Phase 4) ─────────────────────────────────────────────────────
+    program
+        .command('cost')
+        .description('Show token usage and cost breakdown')
+        .action(() => {
+            const summary = queryUsageSummary()
+            const byAgent = queryUsageByAgent()
+
+            console.log('\n💰 Cost Summary\n' + '─'.repeat(50))
+            console.log(`  Last hour:  $${summary.hourly.toFixed(4)}`)
+            console.log(`  Last day:   $${summary.daily.toFixed(4)}`)
+            console.log(`  Last week:  $${summary.weekly.toFixed(4)}`)
+            console.log(`  All time:   $${summary.total.toFixed(4)}`)
+            console.log(`  Total tokens: ${summary.totalTokens.toLocaleString()}`)
+
+            if (byAgent.length > 0) {
+                console.log('\n  Per-Agent Breakdown:')
+                for (const a of byAgent) {
+                    console.log(`    ${(a.agent_id || 'unknown').padEnd(15)} ${a.request_count} reqs  ${(a.total_input + a.total_output).toLocaleString()} tokens  $${a.total_cost.toFixed(4)}`)
+                }
+            }
+            console.log()
+        })
+
     return program
 }
+

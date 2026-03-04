@@ -1,7 +1,7 @@
 import 'dotenv/config'
 import { Telegraf, Markup } from 'telegraf'
 import { checkRateLimit, validateInstruction, isAllowedUser } from '../lib/security.js'
-import { getRecentTasks } from '../lib/memory.js'
+import { getRecentTasks, queryUsageSummary, queryUsageByAgent } from '../lib/memory.js'
 
 /**
  * Create and configure a Telegram bot adapter (DB-Centric async pattern)
@@ -154,6 +154,8 @@ export function createTelegramAdapter(orchestrator, registry, config = {}) {
             '`/agents` — List available agents to talk to\n' +
             '`/agent` — Switch to a specific agent\n' +
             '`/status` — Show agent status\n' +
+            '`/workflow` — Run multi-step workflows\n' +
+            '`/cost` — Show token usage and costs\n' +
             '`/help` — Show help\n\n' +
             'Tip: After choosing an agent via `/agent`, you can just chat directly!',
             { parse_mode: 'Markdown' }
@@ -187,7 +189,11 @@ export function createTelegramAdapter(orchestrator, registry, config = {}) {
         if (role === 'auto') {
             userPreferences.delete(userId)
             await ctx.answerCbQuery('Orchestrator enabled')
-            await ctx.editMessageText('🧠 *Orchestrator* enabled.\n\nSend me a message and I will intelligently delegate it to the best agent.', { parse_mode: 'Markdown' })
+            try {
+                await ctx.editMessageText('🧠 *Orchestrator* enabled.\n\nSend me a message and I will intelligently delegate it to the best agent.', { parse_mode: 'Markdown' })
+            } catch (err) {
+                // Ignore "message is not modified" error
+            }
         } else {
             userPreferences.set(userId, role)
             const roleNames = {
@@ -199,7 +205,11 @@ export function createTelegramAdapter(orchestrator, registry, config = {}) {
                 orchestrator: '🧠 Orchestrator'
             }
             await ctx.answerCbQuery(`${roleNames[role] || role} selected`)
-            await ctx.editMessageText(`${roleNames[role] || role} selected.\n\nYou can now send plain text messages directly to this agent!`, { parse_mode: 'Markdown' })
+            try {
+                await ctx.editMessageText(`${roleNames[role] || role} selected.\n\nYou can now send plain text messages directly to this agent!`, { parse_mode: 'Markdown' })
+            } catch (err) {
+                // Ignore "message is not modified" error
+            }
         }
     })
 
@@ -260,6 +270,74 @@ export function createTelegramAdapter(orchestrator, registry, config = {}) {
         const preferredRole = userPreferences.get(userId)
         const opts = preferredRole ? { role: preferredRole } : {}
         await submitTaskAsync(ctx, instruction, opts)
+    })
+
+    // ── /workflow (Phase 2) ───────────────────────────────────────────────────
+    bot.command('workflow', async (ctx) => {
+        const args = ctx.message.text.replace(/^\/workflow\s*/i, '').trim()
+
+        if (!args || args === 'list') {
+            // List available workflows
+            if (!orchestrator.workflowEngine) {
+                return ctx.reply('Workflow engine not initialized.')
+            }
+            const workflows = orchestrator.workflowEngine.listWorkflows()
+            if (workflows.length === 0) {
+                return ctx.reply('No workflows registered.')
+            }
+            const text = workflows.map(wf =>
+                `📋 *${wf.name}* (${wf.steps} steps)\n   ${wf.description || 'No description'}`
+            ).join('\n\n')
+            return ctx.reply(`*Available Workflows*\n\n${text}\n\nUsage: \`/workflow run <name> <input>\``, { parse_mode: 'Markdown' })
+        }
+
+        const runMatch = args.match(/^run\s+(\S+)\s+(.+)$/s)
+        if (runMatch) {
+            const [, name, input] = runMatch
+            const chatId = ctx.chat.id
+
+            try {
+                validateInstruction(input, config.maxTaskLength || 2000)
+                checkRateLimit(ctx.from?.id, rateLimit)
+            } catch (err) {
+                return ctx.reply(`❌ ${err.message}`)
+            }
+
+            const processingMsg = await ctx.reply(`🔄 Starting workflow: ${name}...`)
+
+            try {
+                await orchestrator.submitWorkflow(name, input, {
+                    telegramChatId: String(chatId)
+                })
+            } catch (err) {
+                return ctx.reply(`❌ Workflow error: ${err.message}`)
+            }
+            return
+        }
+
+        return ctx.reply('Usage:\n`/workflow list` — List workflows\n`/workflow run <name> <input>` — Run a workflow', { parse_mode: 'Markdown' })
+    })
+
+    // ── /cost (Phase 4) ───────────────────────────────────────────────────────
+    bot.command('cost', (ctx) => {
+        const summary = queryUsageSummary()
+        const byAgent = queryUsageByAgent()
+
+        let text = `💰 *Cost Summary*\n\n`
+        text += `Last hour: $${summary.hourly.toFixed(4)}\n`
+        text += `Last day: $${summary.daily.toFixed(4)}\n`
+        text += `Last week: $${summary.weekly.toFixed(4)}\n`
+        text += `All time: $${summary.total.toFixed(4)}\n`
+        text += `Total tokens: ${summary.totalTokens.toLocaleString()}`
+
+        if (byAgent.length > 0) {
+            text += `\n\n*Per-Agent:*\n`
+            for (const a of byAgent) {
+                text += `\`${a.agent_id || 'unknown'}\`: ${(a.total_input + a.total_output).toLocaleString()} tokens, $${a.total_cost.toFixed(4)}\n`
+            }
+        }
+
+        ctx.reply(text, { parse_mode: 'Markdown' })
     })
 
     return bot

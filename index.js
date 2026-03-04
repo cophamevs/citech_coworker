@@ -1,17 +1,25 @@
 import 'dotenv/config'
 import { readFileSync } from 'fs'
 import { mkdirSync } from 'fs'
-import { resolve } from 'path'
+import { resolve, join, dirname } from 'path'
+import { fileURLToPath } from 'url'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
 
 // ── Load config ───────────────────────────────────────────────────────────────
 const config = JSON.parse(readFileSync('./config.json', 'utf-8'))
 
 // ── Bootstrap modules ─────────────────────────────────────────────────────────
-import { initDB, closeDB, buildContextPrompt } from './lib/memory.js'
+import { initDB, closeDB, buildContextPrompt, setEventBus } from './lib/memory.js'
 import { AgentRegistry } from './lib/registry.js'
 import { AgentSpawner } from './lib/agent-spawner.js'
 import { Orchestrator } from './lib/orchestrator.js'
 import { Heartbeat } from './lib/heartbeat.js'
+import { EventBus } from './lib/event-bus.js'
+import { WorkflowEngine } from './lib/workflow.js'
+import { loadWorkflows } from './lib/workflow-loader.js'
+import { loadManifests } from './lib/manifest.js'
+import { CapabilityManager } from './lib/capabilities.js'
 import { createTelegramAdapter } from './adapters/telegram.js'
 import { createCLI } from './adapters/cli.js'
 
@@ -19,10 +27,11 @@ import { createCLI } from './adapters/cli.js'
 const registry = new AgentRegistry()
 let orchestrator
 let heartbeat
+let eventBus
 
-// ── Spawn initial agents from config ──────────────────────────────────────────
-async function spawnConfiguredAgents() {
-    for (const agentDef of (config.agents || [])) {
+// ── Spawn initial agents from config or manifests ─────────────────────────────
+async function spawnConfiguredAgents(agentDefs) {
+    for (const agentDef of agentDefs) {
         const workdir = resolve(agentDef.workdir)
         mkdirSync(workdir, { recursive: true })
 
@@ -34,7 +43,11 @@ async function spawnConfiguredAgents() {
             role: agentDef.role,
             workdir,
             memoryContext: memory,
+            agentMode: agentDef.agentMode || 'build'
         })
+
+        // Store manifest on agent instance (Phase 5)
+        agent.manifest = agentDef
 
         try {
             await agent.start()
@@ -84,7 +97,10 @@ async function gracefulShutdown(signal) {
         agent.kill()
     }
 
-    // 5. Close SQLite
+    // 5. Destroy event bus
+    eventBus.destroy()
+
+    // 6. Close SQLite
     closeDB()
 
     console.log('[shutdown] Done. Goodbye.')
@@ -107,6 +123,11 @@ async function main() {
     const dbFile = process.env.DB_FILE || './data/oc-plugin.db'
     await initDB(dbFile)
 
+    // ── Phase 1: Create EventBus ──
+    eventBus = new EventBus()
+    setEventBus(eventBus)
+    console.log('[index] EventBus initialized')
+
     // Init core services
     orchestrator = new Orchestrator(registry, {
         portStart: parseInt(process.env.OPENCODE_PORT_START || '4096'),
@@ -115,14 +136,47 @@ async function main() {
         taskTimeout: config.task_timeout,
         memoryInjectCount: config.memory_inject_count,
     })
-    heartbeat = new Heartbeat(registry, config.heartbeat_interval * 1000)
+
+    // ── Phase 2: Create WorkflowEngine ──
+    const workflowEngine = new WorkflowEngine({ eventBus })
+    orchestrator.workflowEngine = workflowEngine
+
+    // Load workflow YAML files
+    const workflowsDir = join(__dirname, 'workflows')
+    const workflows = await loadWorkflows(workflowsDir)
+    for (const wf of workflows) {
+        workflowEngine.register(wf)
+    }
+    console.log(`[index] ${workflows.length} workflow(s) loaded`)
+
+    // ── Phase 5: Load agent manifests (fallback to config.json) ──
+    const agentsDir = join(__dirname, 'agents')
+    const manifests = await loadManifests(agentsDir)
+
+    let agentDefs
+    if (manifests.length > 0) {
+        agentDefs = manifests
+        console.log(`[index] Using ${manifests.length} agent manifest(s)`)
+    } else {
+        agentDefs = config.agents || []
+        console.log(`[index] Using config.json agents (${agentDefs.length})`)
+    }
+
+    // ── Phase 6: Capability Manager ──
+    const capabilityManager = new CapabilityManager()
+    if (manifests.length > 0) {
+        capabilityManager.loadFromManifests(manifests)
+    }
+
+    // ── Heartbeat (Phase 3: with consolidation) ──
+    heartbeat = new Heartbeat(registry, config.heartbeat_interval * 1000, { eventBus })
 
     // Spawn agents
-    await spawnConfiguredAgents()
+    await spawnConfiguredAgents(agentDefs)
 
-    // ── Start worker loops on all agents ──
+    // ── Start event-driven worker loops on all agents ──
     for (const agent of registry.getInstances()) {
-        agent.startWorkerLoop(3000)  // poll DB every 3s
+        agent.startWorkerLoop(eventBus)  // Phase 1: event-driven
     }
 
     // Start heartbeat
@@ -137,11 +191,11 @@ async function main() {
         bot.launch()
         console.log('[index] Telegram bot launched')
 
-        // ── Start orchestrator watcher — sends results back to Telegram ──
+        // ── Start event-driven orchestrator watcher ──
         orchestrator.startWatcher(async (task) => {
             await bot.onTaskResult(task)
-        }, 2000)
-        console.log('[index] Orchestrator watcher started')
+        }, eventBus)  // Phase 1: pass eventBus instead of poll interval
+        console.log('[index] Orchestrator watcher started (event-driven)')
     }
 
     // Expose CLI for interactive use
@@ -160,3 +214,4 @@ main().catch((err) => {
     console.error('[fatal]', err)
     process.exit(1)
 })
+

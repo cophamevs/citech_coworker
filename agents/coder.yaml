@@ -1,0 +1,28 @@
+# Agent Manifest: Coder
+id: agent-01
+role: coder
+name: Coder Agent
+port: 4096
+workdir: ./workspace/agent-01
+
+# Model preference (informational — actual model set in OpenCode config)
+model: claude-sonnet
+agentMode: build
+
+# Capabilities this agent is allowed to use
+capabilities:
+  - code.read
+  - code.write
+  - code.execute
+  - file.read
+  - file.write
+  - terminal.run
+
+# Budget limits
+budget:
+  hourly: 1.00    # max $1/hour
+  daily: 10.00    # max $10/day
+
+# Template variables injected into role prompt
+variables:
+  STYLE: "clean, well-documented, production-ready"
