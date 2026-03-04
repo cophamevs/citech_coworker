@@ -1,0 +1,24 @@
+﻿# Dependencies
+node_modules/
+
+# Environment
+.env
+.env.local
+
+# Database
+data/*.db
+data/*.db-journal
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Workspace agent dirs
+workspace/

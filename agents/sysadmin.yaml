@@ -1,0 +1,23 @@
+# Agent Manifest: Sysadmin
+id: agent-02
+role: sysadmin
+name: Sysadmin Agent
+port: 4097
+workdir: ./workspace/agent-02
+
+model: claude-sonnet
+agentMode: plan
+
+capabilities:
+  - terminal.run
+  - file.read
+  - file.write
+  - system.monitor
+  - network.check
+
+budget:
+  hourly: 0.50
+  daily: 5.00
+
+variables:
+  ENVIRONMENT: "development"

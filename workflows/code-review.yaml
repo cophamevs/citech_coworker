@@ -1,0 +1,24 @@
+name: code-review
+description: "2-step pipeline: coder reviews code → researcher summarizes findings"
+steps:
+  - name: review
+    role: coder
+    prompt: |
+      Review the following code or feature for bugs, security issues,
+      performance problems, and code quality:
+
+      {{input}}
+
+      Provide detailed findings with severity levels (critical/warning/info).
+    error_mode: fail
+
+  - name: summarize
+    role: researcher
+    prompt: |
+      Summarize this code review into an actionable report:
+
+      ## Review Findings
+      {{review}}
+
+      Organize by severity and provide recommended fixes for each issue.
+    error_mode: skip

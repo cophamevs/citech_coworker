@@ -1,0 +1,32 @@
+name: research-and-implement
+description: "3-step pipeline: research → plan → implement"
+steps:
+  - name: research
+    role: researcher
+    prompt: "Research the following topic and provide a comprehensive summary: {{input}}"
+    error_mode: fail
+
+  - name: plan
+    role: planner
+    prompt: |
+      Based on this research, create a detailed implementation plan:
+
+      ## Research Results
+      {{research}}
+
+      Create a step-by-step plan with specific files and changes needed.
+    error_mode: fail
+
+  - name: implement
+    role: coder
+    prompt: |
+      Implement the following plan:
+
+      ## Plan
+      {{plan}}
+
+      Original request: {{input}}
+
+      Follow the plan exactly. Create or modify files as specified.
+    error_mode: retry
+    max_retries: 2

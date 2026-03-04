@@ -1,0 +1,28 @@
+{
+    "name": "oc-plugin",
+    "version": "1.0.0",
+    "description": "OpenCode Multi-Agent Plugin Layer — HTTP API",
+    "type": "module",
+    "main": "index.js",
+    "bin": {
+        "oc": "./adapters/cli.js"
+    },
+    "scripts": {
+        "start": "node index.js",
+        "dev": "node --watch index.js",
+        "test": "node --test"
+    },
+    "dependencies": {
+        "@opencode-ai/sdk": "latest",
+        "chokidar": "^3.6.0",
+        "commander": "^12.0.0",
+        "dotenv": "^16.4.0",
+        "js-yaml": "^4.1.1",
+        "node-sqlite3-wasm": "^0.8.0",
+        "telegraf": "^4.16.0",
+        "uuid": "^9.0.0"
+    },
+    "engines": {
+        "node": ">=18.0.0"
+    }
+}
